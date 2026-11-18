@@ -45,12 +45,16 @@ jobs:
         working-directory: ${{ env.SERVICE_DIR }}
         run: ./gradlew test
 
-      - name: Upload test results
+      # Publié même en cas d'échec : c'est précisément là qu'on en a besoin.
+      - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: java-test-results
-          path: ${{ env.SERVICE_DIR }}/build/test-results/
+          name: java-test-reports
+          path: |
+            ${{ env.SERVICE_DIR }}/build/test-results/test/
+            ${{ env.SERVICE_DIR }}/build/reports/tests/test/
+          retention-days: 7
 
   quality:
     name: Java quality
@@ -67,9 +71,18 @@ jobs:
           distribution: 'corretto'
           cache: gradle
 
+      # --continue : analyse main et test même si l'un des deux échoue.
       - name: Run Checkstyle
         working-directory: ${{ env.SERVICE_DIR }}
-        run: ./gradlew checkstyleMain checkstyleTest
+        run: ./gradlew --continue checkstyleMain checkstyleTest
+
+      - name: Upload Checkstyle reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-checkstyle-reports
+          path: ${{ env.SERVICE_DIR }}/build/reports/checkstyle/
+          retention-days: 7
 
   image:
     name: Java Docker image
