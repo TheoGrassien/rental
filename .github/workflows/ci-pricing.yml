@@ -1,26 +1,36 @@
-name: CI/CD - pricing-service
+name: Python CI
 
 on:
+  # Pas de filtre paths ni branches sur pull_request : les contrôles requis
+  # doivent être rapportés sur toutes les PR, sinon elles restent bloquées.
+  pull_request:
   push:
     branches: [main, develop]
     paths:
       - 'apps/pricing-service/**'
       - '.github/workflows/ci-pricing.yml'
-  pull_request:
-    branches: [main, develop]
-    paths:
-      - 'apps/pricing-service/**'
-      - '.github/workflows/ci-pricing.yml'
+  workflow_dispatch:
+
+# Moindre privilège par défaut ; seul le job image élève ses droits.
+permissions:
+  contents: read
+
+# Une nouvelle exécution sur la même PR annule la précédente devenue obsolète.
+# Sur main et develop, on laisse chaque push aller au bout.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  SERVICE_DIR: apps/pricing-service
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/pricing-service
+  PYTHON_VERSION: '3.12'
 
 jobs:
-  test:
+  tests:
     name: Python tests
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -28,36 +38,87 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: apps/pricing-service/requirements-dev.txt
+          cache-dependency-path: ${{ env.SERVICE_DIR }}/requirements-dev.txt
 
       - name: Install dependencies
-        working-directory: apps/pricing-service
+        working-directory: ${{ env.SERVICE_DIR }}
         run: python -m pip install -r requirements-dev.txt
 
       - name: Run tests
-        working-directory: apps/pricing-service
+        working-directory: ${{ env.SERVICE_DIR }}
         run: |
           mkdir -p build/test-results
           python -m pytest --junitxml=build/test-results/pytest.xml
 
-      - name: Upload test results
+      # Publié même en cas d'échec : c'est précisément là qu'on en a besoin.
+      - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pricing-test-results
-          path: apps/pricing-service/build/test-results/
+          name: python-test-reports
+          path: ${{ env.SERVICE_DIR }}/build/test-results/
+          retention-days: 7
 
-  build-and-push:
-    name: Build Docker image
+  quality:
+    name: Python quality
     runs-on: ubuntu-latest
-    needs: test
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.SERVICE_DIR }}/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: ${{ env.SERVICE_DIR }}
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Ruff lint
+        working-directory: ${{ env.SERVICE_DIR }}
+        run: python -m ruff check app tests
+
+      # Exécutée même si le lint échoue, pour voir les deux problèmes en une fois.
+      - name: Ruff format
+        if: ${{ !cancelled() }}
+        working-directory: ${{ env.SERVICE_DIR }}
+        run: python -m ruff format --check app tests
+
+      # Rapport structuré du lint ; --exit-zero car le verdict est déjà
+      # porté par l'étape « Ruff lint ».
+      - name: Write Ruff report
+        if: ${{ !cancelled() }}
+        working-directory: ${{ env.SERVICE_DIR }}
+        run: |
+          mkdir -p build/reports/ruff
+          python -m ruff check app tests --exit-zero \
+            --output-format junit --output-file build/reports/ruff/ruff-check.xml
+
+      - name: Upload Ruff report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-quality-reports
+          path: ${{ env.SERVICE_DIR }}/build/reports/ruff/
+          retention-days: 7
+
+  image:
+    name: Python Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [tests, quality]
     permissions:
       contents: read
-      packages: write
-      security-events: write
-
+      packages: write          # push vers GHCR, utilisé uniquement sur main
+      security-events: write   # envoi du rapport Trivy, uniquement sur main
+    env:
+      PUBLISH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -66,41 +127,48 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Container Registry
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # metadata-action met le nom d'image en minuscules (exigé par Docker),
+      # ce que github.repository ne garantit pas (ex. TheoGrassien/rental).
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/pricing-service
           tags: |
             type=ref,event=branch
+            type=ref,event=pr
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Build and push Docker image
+      # Cache de couches dans le cache GitHub Actions : aucun droit
+      # d'écriture sur le registre n'est nécessaire depuis une PR.
+      - name: Build (and push on main)
         uses: docker/build-push-action@v5
         with:
-          context: apps/pricing-service
-          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          context: ${{ env.SERVICE_DIR }}
+          push: ${{ env.PUBLISH == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=pricing-service
+          cache-to: type=gha,scope=pricing-service,mode=max
 
       - name: Scan Docker image with Trivy
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: aquasecurity/trivy-action@master
+        if: env.PUBLISH == 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          image-ref: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
           format: sarif
           output: trivy-results.sarif
 
       - name: Upload Trivy results to GitHub Security
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: env.PUBLISH == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
