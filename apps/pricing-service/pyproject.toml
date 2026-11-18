@@ -1,3 +1,13 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+# Version minimale supportée : celle de l'image Docker et de la CI.
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# E : erreurs pycodestyle, F : Pyflakes (noms inutilisés, imports morts),
+# I : tri des imports (équivalent isort).
+select = ["E", "F", "I"]
