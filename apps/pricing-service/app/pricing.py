@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass
 
 DAILY_RATES = {
