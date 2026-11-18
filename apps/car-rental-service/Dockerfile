@@ -2,7 +2,7 @@
 FROM gradle:8.14-jdk17 AS builder
 WORKDIR /app
 COPY . .
-RUN gradle clean build -x test
+RUN gradle clean bootJar
 
 # Runtime stage
 FROM eclipse-temurin:17-jre-jammy
